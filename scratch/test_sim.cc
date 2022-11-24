@@ -10,7 +10,7 @@
 #include <cmath>
 #include <random>
 #include <tuple>
-
+#include "ns3/netanim-module.h"
 
 using namespace ns3;
 NS_LOG_COMPONENT_DEFINE("NetworkScenario");
@@ -52,6 +52,9 @@ class NetworkScenario
         void apply_network_conf();
         void create_remote_server();
         void create_ue_applications();
+        static void callback_ipv4_packet_received(PacketSizeMinMaxAvgTotalCalculator* packet_calc,Ptr<const Packet> packet, Ptr<Ipv4> ipv4, uint32_t iface);
+        void callback_ue_spotted_at_enb(std::string context, const uint64_t imsi, const uint16_t cell_id, const uint16_t rnti);
+        void callback_measurement_report_received(const uint64_t imsi, const uint16_t cell_id,  const uint16_t rnti, const LteRrcSap::MeasurementReport report);
         void setup_callbacks();
         
 
@@ -87,6 +90,7 @@ void NetworkScenario::initialize(
 void NetworkScenario::run(){
     this->dump_initial_state();
     this->periodically_interact_with_agent();
+    AnimationInterface anim ("wireless-animation.xml"); // Mandatory
     Simulator::Run();
     Simulator::Destroy();
 }
@@ -125,6 +129,71 @@ void NetworkScenario::create_ue_nodes()
         Ptr<MobilityModel> mobility = ue_node->GetObject<MobilityModel>();
         mobility->SetPosition(Vector(0+(i*20), 0+(i*20),0 ));
     }
+}
+
+void NetworkScenario::setup_callbacks()
+{
+    // Create packet calculators for each UE, and set up callbacks to count the
+    // number of bytes received over IPv4. Used by get_ue_rx_bytes() below
+    for (uint32_t i = 0; i < this->ue_nodes.GetN(); i++) {
+        PacketSizeMinMaxAvgTotalCalculator *packet_calc = new PacketSizeMinMaxAvgTotalCalculator();
+        this->ue_nodes.Get(i)->GetObject<Ipv4L3Protocol>()->TraceConnectWithoutContext("Rx", MakeBoundCallback(&NetworkScenario::callback_ipv4_packet_received, packet_calc));
+        this->ue_packet_calcs.push_back(packet_calc);
+    }
+
+    // Connect callbacks to trigger whenever a UE is connected to a new eNodeB,
+    // either because of initial network attachment or because of handovers
+    Config::Connect("/NodeList/*/DeviceList/*/LteEnbRrc/ConnectionEstablished",
+        MakeCallback(&NetworkScenario::callback_ue_spotted_at_enb, this));
+    Config::Connect("/NodeList/*/DeviceList/*/LteEnbRrc/HandoverEndOk",
+        MakeCallback(&NetworkScenario::callback_ue_spotted_at_enb, this));
+
+    // Connect callback for whenever an eNodeB receives "measurement reports".
+    // These reports contain signal strength information of neighboring cells,
+    // as seen by a UE. This is used by the eNodeB to determine handovers
+    Config::ConnectWithoutContext("/NodeList/*/DeviceList/*/LteEnbRrc/RecvMeasurementReport",
+        MakeCallback(&NetworkScenario::callback_measurement_report_received, this));
+}
+
+void NetworkScenario::callback_ue_spotted_at_enb(
+        std::string context, const uint64_t imsi,
+        const uint16_t cell_id, const uint16_t rnti)
+{
+    // A given eNodeB (identified by cell ID) has become responsible for an UE
+    // (identified by its IMSI), due to initial network attachment or handover
+    std::cout << this->timestep() << " ms: UE seen at cell: "
+        << "Cell " << (int)cell_id << " saw IMSI " << imsi << std::endl;
+}
+void NetworkScenario::callback_ipv4_packet_received(
+        PacketSizeMinMaxAvgTotalCalculator* packet_calc,
+        Ptr<const Packet> packet, Ptr<Ipv4> ipv4, uint32_t iface)
+{
+    // Callback for each packet received at the IPv4 layer. Pass the packet
+    // directly on to the PacketSizeMinMaxAvgTotalCalculator, which is used by
+    // the periodic UE state reporting method via this->get_ue_rx_bytes()
+    packet_calc->PacketUpdate("", packet);
+}  
+void NetworkScenario::callback_measurement_report_received(
+        const uint64_t imsi, const uint16_t cell_id,
+        const uint16_t rnti, const LteRrcSap::MeasurementReport report)
+{
+    // An eNodeB has received a measurement report of neighboring cell signal
+    // strengths from an attached UE. Dump interesting information to stdout
+    std::cout << this->timestep() << " ms: Measurement report: "
+        << "Cell " << (int)cell_id
+        << " got report from IMSI " << imsi
+        << ": " << (int)cell_id
+        << "/" << (int)report.measResults.rsrpResult
+        << "/" << (int)report.measResults.rsrqResult;
+
+    // There might be additional measurements to the one listed directly in the
+    // data structure, hence we need to do some additional iteration
+    for (auto iter = report.measResults.measResultListEutra.begin();
+            iter != report.measResults.measResultListEutra.end(); iter++) {
+        std::cout << " " << (int)iter->physCellId << "/"
+            << (int)iter->rsrpResult << "/" << (int)iter->rsrqResult;
+    }
+    std::cout << std::endl;
 }
 
 
@@ -218,6 +287,9 @@ void NetworkScenario::create_lte_network()
     this->epc_helper = CreateObject<PointToPointEpcHelper>();
     this->lte_helper = CreateObject<LteHelper>();
     this->lte_helper->SetEpcHelper(this->epc_helper);
+    
+
+
 
     // Set up a directional antenna, to allow 3-sector base stations
     this->lte_helper->SetEnbAntennaModelType("ns3::ParabolicAntennaModel");
@@ -337,7 +409,7 @@ int main(){
 
         int num_enb=2;
         std::vector<std::vector<int>> enb_position{std::vector<int>{50,50,0}, std::vector<int>{250,250,0}};
-        std::vector<int> enb_power{300,300};
+        std::vector<int> enb_power{150,150};
         std::vector<int> ue_per_enb{5,5};
         NetworkScenario *scenario;
         scenario = new NetworkScenario();
